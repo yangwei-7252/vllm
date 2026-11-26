@@ -13,6 +13,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_gather,
 )
+from vllm.distributed.vocab_parallel import join_vocab_shards
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -177,6 +178,40 @@ class LogitsProcessor(PluggableLayer):
             embedding_bias.to(self.head_dtype) if embedding_bias is not None else None,
         )
 
+    def _get_dp_sharded_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        group = lm_head.vocab_exchange_group
+        assert group is not None
+        capacity = lm_head.logits_exchange_rows
+        rows = hidden_states.shape[0]
+        if rows > capacity:
+            raise ValueError("Sample rows exceed the LM head exchange capacity.")
+        padded = F.pad(hidden_states, (0, 0, 0, capacity - rows))
+        logits = self._apply_head(
+            lm_head, group.all_gather(padded, dim=0), embedding_bias
+        )
+        # Each physical shard stores base vocab first and added vocab second.
+        # Discard added rows before concatenating the base vocabulary shards.
+        base_width = lm_head.org_vocab_size_padded // lm_head.tp_size
+        return logits[..., :base_width]
+
+    def _return_vocab_columns(
+        self, columns: torch.Tensor, lm_head: VocabParallelEmbedding, rows: int
+    ) -> torch.Tensor:
+        group = lm_head.vocab_exchange_group
+        assert group is not None
+        received = torch.ops.vllm.vocab_all_to_all(
+            columns.contiguous(), group.unique_name
+        )
+        local = join_vocab_shards(
+            received, group.world_size, lm_head.logits_exchange_rows
+        )
+        return tensor_model_parallel_all_gather(local[:rows].contiguous(), dim=-1)
+
     def _get_logits(
         self,
         hidden_states: torch.Tensor,
@@ -184,6 +219,17 @@ class LogitsProcessor(PluggableLayer):
         embedding_bias: torch.Tensor | None,
         skip_gather: bool = False,
     ) -> torch.Tensor | None:
+        if (
+            getattr(lm_head, "vocab_exchange_group", None) is not None
+            and not skip_gather
+        ):
+            partial = self._get_dp_sharded_logits(
+                hidden_states, lm_head, embedding_bias
+            )
+            logits = self._return_vocab_columns(
+                partial, lm_head, hidden_states.shape[0]
+            )
+            return logits[..., : self.org_vocab_size]
         # Get the logits for the next tokens.
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         if skip_gather:
@@ -230,6 +276,9 @@ class LogitsProcessor(PluggableLayer):
                 "The local argmax reduction optimization is not supported for "
                 "non-positive logit scaling factors."
             )
+        if getattr(lm_head, "vocab_exchange_group", None) is not None:
+            ids, _ = self.get_top_k_tokens(lm_head, hidden_states, 1, embedding_bias)
+            return ids.squeeze(-1)
         tp_size = lm_head.tp_size
 
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
@@ -289,6 +338,30 @@ class LogitsProcessor(PluggableLayer):
                 "non-positive logit scaling factors."
             )
 
+        if getattr(lm_head, "vocab_exchange_group", None) is not None:
+            if return_log_probs:
+                logits = self.forward(lm_head, hidden_states, embedding_bias)
+                assert logits is not None
+                values, ids = _topk(F.log_softmax(logits.float(), dim=-1), k)
+                return ids.to(torch.int64), values
+            logits = self._get_dp_sharded_logits(hidden_states, lm_head, embedding_bias)
+            rows = hidden_states.shape[0]
+            self._mask_outside_vocab(logits, lm_head)
+            shard_k = min(k, logits.shape[-1])
+            if shard_k == 1:
+                values, ids = logits.max(dim=-1, keepdim=True)
+            else:
+                values, ids = _topk(logits, shard_k)
+            ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
+            values = self._return_vocab_columns(values, lm_head, rows)
+            ids = self._return_vocab_columns(ids, lm_head, rows)
+            if shard_k == 1 and k == 1:
+                values, selected = values.max(dim=-1, keepdim=True)
+            else:
+                values, selected = _topk(values, k)
+            return ids.gather(-1, selected), self._transform_top_k_scores(
+                values.float()
+            )
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         if return_log_probs:
             if self.soft_cap is not None:
@@ -320,11 +393,14 @@ class LogitsProcessor(PluggableLayer):
         values = values.float()
         if return_log_probs:
             return ids, values - log_partition
+        return ids, self._transform_top_k_scores(values)
+
+    def _transform_top_k_scores(self, values: torch.Tensor) -> torch.Tensor:
         if self.scale != 1.0:
             values = values * self.scale
         if self.soft_cap is not None:
             values = torch.tanh(values / self.soft_cap) * self.soft_cap
-        return ids, values
+        return values
 
     def extra_repr(self) -> str:
         s = f"vocab_size={self.vocab_size}"

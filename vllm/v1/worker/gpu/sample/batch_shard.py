@@ -12,6 +12,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.vocab_parallel import join_vocab_shards
 from vllm.triton_utils import tl, triton
 from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.outputs import LogprobsTensors
@@ -411,12 +412,7 @@ def all_to_all_vocab_shards(
             input_split_sizes=send_splits,
             group=get_tp_group().device_group,
         )
-    shard_width = recv.shape[-1]
-    return (
-        recv.view(tp_size, num_local_rows, shard_width)
-        .permute(1, 0, 2)
-        .reshape(num_local_rows, tp_size * shard_width)
-    )
+    return join_vocab_shards(recv, tp_size, num_local_rows)
 
 
 def _shard_grammar_output(

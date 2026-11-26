@@ -333,6 +333,7 @@ class GraniteMoeModel(nn.Module, EagleModelMixin):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.embedding_multiplier = config.embedding_multiplier
 

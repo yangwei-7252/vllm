@@ -3,6 +3,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import lcm
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     GroupCoordinator,
     divide,
@@ -17,6 +19,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.parallel_state import get_vocab_exchange_group
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.determinism.batch_invariant import (
     linear_batch_invariant,
@@ -249,6 +252,8 @@ class VocabParallelEmbedding(PluggableLayer):
         reduce_results: Whether to all-reduce contributions from vocabulary shards.
         quant_method: Preselected quantization method for model-specific layers.
         parallel_group: Process group used to shard and reduce the embedding.
+        is_token_embedding: Identify token lookup tables whose prefixes are
+            not among the standard model token-embedding names.
 
     """  # noqa: E501
 
@@ -268,6 +273,7 @@ class VocabParallelEmbedding(PluggableLayer):
         reduce_results: bool = True,
         quant_method: QuantizeMethodBase | None = None,
         parallel_group: GroupCoordinator | None = None,
+        is_token_embedding: bool = False,
     ):
         super().__init__()
 
@@ -283,6 +289,37 @@ class VocabParallelEmbedding(PluggableLayer):
         else:
             tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
+        self.vocab_exchange_group: GroupCoordinator | None = None
+        config = get_current_vllm_config_or_none()
+        if (
+            config is not None
+            and not disable_tp
+            and parallel_group is None
+            and reduce_results
+        ):
+            pc = config.parallel_config
+            size = 1
+            if isinstance(self, ParallelLMHead):
+                size = pc.lmhead_tensor_parallel_size
+            elif is_token_embedding or prefix.rsplit(".", 1)[-1] in (
+                "embed_tokens",
+                "tok_embeddings",
+                "word_embeddings",
+                "wte",
+            ):
+                size = pc.embedding_tensor_parallel_size
+            if size > 1:
+                self.vocab_exchange_group = get_vocab_exchange_group(size)
+                tp_rank = tp_rank * size + self.vocab_exchange_group.rank_in_group
+                self.tp_size *= size
+                padding_size = lcm(padding_size, self.tp_size)
+                self.embedding_exchange_rows = max(
+                    config.scheduler_config.max_num_batched_tokens,
+                    config.compilation_config.max_cudagraph_capture_size or 0,
+                )
+                self.logits_exchange_rows = config.scheduler_config.max_num_seqs * (
+                    1 + config.num_speculative_tokens
+                )
         self.tp_rank = tp_rank
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
@@ -529,6 +566,16 @@ class VocabParallelEmbedding(PluggableLayer):
         if self.tp_size == 1:
             return self.quant_method.embedding(self, input_.long())
 
+        group = self.vocab_exchange_group
+        if group is not None:
+            original_shape = input_.shape
+            ids = input_.reshape(-1)
+            if ids.numel() > self.embedding_exchange_rows:
+                raise ValueError("Token rows exceed the embedding exchange capacity.")
+            input_ = group.all_gather(
+                F.pad(ids, (0, self.embedding_exchange_rows - ids.numel())), dim=0
+            )
+
         if self.use_fused_embedding:
             output_parallel = ops.vocab_parallel_embedding(
                 input_ if input_.ndim == 1 else input_.reshape(-1),
@@ -560,6 +607,11 @@ class VocabParallelEmbedding(PluggableLayer):
             output_parallel = output_parallel.view(torch.int8)
         if not self.use_fused_embedding:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        if group is not None:
+            output_parallel = group.reduce_scatter(output_parallel, dim=0)
+            output_parallel = output_parallel[: ids.numel()].reshape(
+                *original_shape, self.embedding_dim
+            )
         if self.reduce_results:
             output_parallel = (
                 self.parallel_group.all_reduce(output_parallel)
@@ -640,6 +692,17 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def tie_weights(self, embed_tokens: VocabParallelEmbedding):
         """Tie the weights with word embeddings."""
+        if (
+            getattr(self, "vocab_exchange_group", None) is not None
+            or getattr(embed_tokens, "vocab_exchange_group", None) is not None
+        ) and (self.tp_size, self.tp_rank, self.shard_indices) != (
+            embed_tokens.tp_size,
+            embed_tokens.tp_rank,
+            embed_tokens.shard_indices,
+        ):
+            raise ValueError(
+                "Tied vocabulary weights must have matching vocabulary shards."
+            )
         return self.quant_method.tie_weights(self, embed_tokens)
 
     def forward(self, input_):

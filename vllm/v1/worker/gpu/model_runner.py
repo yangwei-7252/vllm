@@ -60,6 +60,10 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 from vllm.model_executor.layers.quantization.online.lm_head import (
     refresh_quantized_lm_heads,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload.inplace import reload_weights
 from vllm.model_executor.model_loader.utils import log_layer_backends
@@ -427,6 +431,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_config=self.vllm_config.model_config,
                 )
             log_layer_backends(self.model, self.vllm_config.model_config)
+            self._verify_vocab_parallel_layers()
             if self.lora_config:
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
@@ -634,6 +639,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         only pipeline stage: it runs whole on the last PP rank."""
         with use_workspace_lane(self._draft_workspace_lane), single_pp_stage():
             yield
+
+    def _verify_vocab_parallel_layers(self) -> None:
+        embed_tp = self.parallel_config.embedding_tensor_parallel_size
+        head_tp = self.parallel_config.lmhead_tensor_parallel_size
+        if max(embed_tp, head_tp) == 1:
+            return
+        sharded = [
+            layer
+            for layer in self.model.modules()
+            if isinstance(layer, VocabParallelEmbedding)
+            and getattr(layer, "vocab_exchange_group", None) is not None
+        ]
+        if embed_tp > 1 and all(isinstance(layer, ParallelLMHead) for layer in sharded):
+            raise ValueError(
+                "This model has no token embedding eligible for cross-DP sharding."
+            )
+        # Some models project with the embedding directly when weights are tied.
+        tied_head = bool(sharded) and getattr(
+            self.model_config.hf_text_config, "tie_word_embeddings", False
+        )
+        if (
+            head_tp > 1
+            and not tied_head
+            and not any(isinstance(layer, ParallelLMHead) for layer in sharded)
+        ):
+            raise ValueError(
+                "This model has no LM head eligible for cross-DP sharding."
+            )
 
     def on_target_weights_replaced(self) -> None:
         # Called whenever the target's weights are replaced (reload, weight
@@ -1019,6 +1052,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         self.step_timing.forward_end()
+
+        if self.parallel_config.lmhead_tensor_parallel_size > 1 and not is_profile:
+            # Active peers enter the target head before proposing draft tokens.
+            assert hidden_states is not None
+            self.model_state.compute_sample_logits(hidden_states[:1])
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
@@ -2101,7 +2139,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # model reads these instead of input_ids, so embed the random ids.
                 inputs_embeds = self.model_state.dummy_inputs_embeds(
                     input_batch.num_tokens_after_padding,
-                    input_ids if randomize_inputs else None,
+                    input_ids
+                    if randomize_inputs
+                    or self.parallel_config.embedding_tensor_parallel_size > 1
+                    else None,
                 )
             else:
                 scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs

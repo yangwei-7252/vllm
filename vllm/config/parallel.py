@@ -252,6 +252,10 @@ class ParallelConfig:
     """Number of pipeline parallel groups."""
     tensor_parallel_size: int = Field(default=1, ge=1)
     """Number of tensor parallel groups."""
+    embedding_tensor_parallel_size: int = Field(default=1, ge=1)
+    """DP-axis sharding factor for token embedding weights, in addition to TP."""
+    lmhead_tensor_parallel_size: int = Field(default=1, ge=1)
+    """DP-axis sharding factor for LM head weights, in addition to TP."""
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of ranks that split prefill sequence computation. PCP expands
     the process world size but does not increase the KV-cache shard count."""
@@ -678,8 +682,30 @@ class ParallelConfig:
                     )
         return value
 
+    def validate_vocab_parallel_sizes(self) -> None:
+        for size in (
+            self.embedding_tensor_parallel_size,
+            self.lmhead_tensor_parallel_size,
+        ):
+            if self.data_parallel_size % size:
+                raise ValueError("Vocabulary TP size must divide data_parallel_size.")
+        if (
+            max(self.embedding_tensor_parallel_size, self.lmhead_tensor_parallel_size)
+            > 1
+        ) and (
+            self.pipeline_parallel_size > 1
+            or self.enable_elastic_ep
+            or self.enable_fault_tolerance
+        ):
+            raise ValueError("Vocabulary TP requires a static DP group and PP=1.")
+        if self.lmhead_tensor_parallel_size > 1 and self.enable_batch_sharded_sampling:
+            raise ValueError(
+                "LM head TP and batch-sharded sampling cannot be combined."
+            )
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
+        self.validate_vocab_parallel_sizes()
         if self._api_process_rank >= self._api_process_count:
             raise ValueError(
                 "Invalid value of `_api_process_rank`. "

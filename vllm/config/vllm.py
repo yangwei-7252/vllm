@@ -2177,6 +2177,7 @@ class VllmConfig:
                 "to True to enable."
             )
         current_platform.check_and_update_config(self)
+        self._validate_vocab_parallelism()
 
         # After the platform hook, which has the last word on async scheduling.
         if (
@@ -3527,6 +3528,33 @@ class VllmConfig:
                 "Adaptive verification is not currently compatible "
                 "with pipeline parallelism"
             )
+
+    def _validate_vocab_parallelism(self) -> None:
+        pc = self.parallel_config
+        pc.validate_vocab_parallel_sizes()
+        embed_size = pc.embedding_tensor_parallel_size
+        head_size = pc.lmhead_tensor_parallel_size
+        if max(embed_size, head_size) == 1 or self.model_config is None:
+            return
+        if not self.model_config.is_moe or self.model_config.runner_type != "generate":
+            raise ValueError(
+                "Cross-DP vocabulary sharding requires a MoE generation model."
+            )
+        if (
+            getattr(self.model_config.hf_text_config, "tie_word_embeddings", False)
+            and embed_size != head_size
+        ):
+            raise ValueError(
+                "Tied vocabulary weights require equal embedding and LM head TP sizes."
+            )
+        if self.lora_config:
+            raise ValueError("LoRA is unsupported with cross-DP vocabulary sharding.")
+        if (
+            head_size > 1
+            and self.speculative_config
+            and self.speculative_config.method == "lilicorr"
+        ):
+            raise ValueError("LiLiCorr candidate scoring does not support LM head TP.")
 
     def _validate_batch_sharded_sampling(self) -> None:
         """Validate `enable_batch_sharded_sampling` against the rest of the config."""

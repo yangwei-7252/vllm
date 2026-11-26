@@ -29,7 +29,7 @@ import pickle
 import weakref
 from collections import deque, namedtuple
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from math import gcd
@@ -202,6 +202,14 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._all_reduce_out_place(tensor)
+
+
+def vocab_all_to_all(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Exchange equal-sized row blocks without tracing into the communicator."""
+    group = _groups[group_name]()
+    if group is None or group.device_communicator is None:
+        raise ValueError(f"No device communicator for {group_name}")
+    return group.device_communicator.all_to_all_single(tensor)
 
 
 def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
@@ -399,6 +407,12 @@ def patched_fused_scaled_matmul_reduce_scatter(
 direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
+    fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="vocab_all_to_all",
+    op_func=vocab_all_to_all,
     fake_impl=all_reduce_fake,
 )
 
@@ -1697,6 +1711,12 @@ def in_single_pp_stage() -> bool:
 
 
 _DP: GroupCoordinator | None = None
+_VOCAB_GROUPS: dict[int, GroupCoordinator] = {}
+
+
+def get_vocab_exchange_group(size: int) -> GroupCoordinator:
+    """DP-axis group exchanging independent token rows for a vocabulary layer."""
+    return _VOCAB_GROUPS[size]
 
 
 def get_dp_group() -> GroupCoordinator:
@@ -1774,7 +1794,11 @@ def graph_capture(device: torch.device, stream: torch.cuda.Stream | None = None)
         tp.graph_capture(context),
         pp.graph_capture(context),
         dp.graph_capture(context),
+        ExitStack() as stack,
     ):
+        for group in _VOCAB_GROUPS.values():
+            if group is not dp:
+                stack.enter_context(group.graph_capture(context))
         yield context
 
 
@@ -2393,6 +2417,27 @@ def initialize_model_parallel(
         _DP = init_model_parallel_group(
             group_ranks, get_world_group().local_rank, backend, group_name="dp"
         )
+    for size in sorted(
+        {
+            parallel_config.embedding_tensor_parallel_size,
+            parallel_config.lmhead_tensor_parallel_size,
+        }
+        - {1}
+    ):
+        if size == data_parallel_size:
+            _VOCAB_GROUPS[size] = _DP
+        else:
+            chunks = [
+                ranks[start : start + size]
+                for ranks in group_ranks
+                for start in range(0, data_parallel_size, size)
+            ]
+            _VOCAB_GROUPS[size] = init_model_parallel_group(
+                chunks,
+                get_world_group().local_rank,
+                backend,
+                group_name=f"vocab_dp_{size}",
+            )
     if 1 < engram_dp_size == data_parallel_size:
         # Same ranks as the DP group: reuse its communicators.
         _ENGRAM_DP = _DP
@@ -2597,6 +2642,10 @@ def destroy_model_parallel():
     _PP_SINGLE_STAGE = None
 
     global _DP, _ENGRAM_DP
+    for group in _VOCAB_GROUPS.values():
+        if group is not _DP:
+            group.destroy()
+    _VOCAB_GROUPS.clear()
     if _ENGRAM_DP and _ENGRAM_DP is not _DP:
         _ENGRAM_DP.destroy()
     _ENGRAM_DP = None

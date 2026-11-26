@@ -518,6 +518,8 @@ class EngineArgs:
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
     device_ids: list[int | str] | None = None
+    embedding_tensor_parallel_size: int = ParallelConfig.embedding_tensor_parallel_size
+    lmhead_tensor_parallel_size: int = ParallelConfig.lmhead_tensor_parallel_size
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
@@ -1206,6 +1208,14 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
+        )
+        parallel_group.add_argument(
+            "--embedding-tensor-parallel-size",
+            **parallel_kwargs["embedding_tensor_parallel_size"],
+        )
+        parallel_group.add_argument(
+            "--lmhead-tensor-parallel-size",
+            **parallel_kwargs["lmhead_tensor_parallel_size"],
         )
         parallel_group.add_argument(
             "--decode-context-parallel-size",
@@ -2583,6 +2593,8 @@ class EngineArgs:
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
+            embedding_tensor_parallel_size=self.embedding_tensor_parallel_size,
+            lmhead_tensor_parallel_size=self.lmhead_tensor_parallel_size,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,
             data_parallel_rank=self.data_parallel_rank or 0,

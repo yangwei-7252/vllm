@@ -174,6 +174,13 @@ class InputProcessor:
             if not supported_generation_tasks:
                 raise VLLMValidationError("This model does not support generation")
 
+            if self.vllm_config.parallel_config.lmhead_tensor_parallel_size > 1 and (
+                params.prompt_logprobs is not None
+                or params.prompt_logprob_token_ids is not None
+            ):
+                raise VLLMValidationError(
+                    "Prompt logprobs are unsupported with LM head TP."
+                )
             params.verify(
                 self.model_config,
                 self.speculative_config,

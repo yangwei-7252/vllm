@@ -18,6 +18,55 @@ from vllm.platforms import current_platform
 
 MODEL_NAME = "ibm-research/PowerMoE-3b"
 
+
+@pytest.mark.parametrize("enforce_eager", [True, False])
+def test_cross_dp_vocab_tp_with_idle_replica(enforce_eager):
+    """One request leaves a DP rank idle during both prefill and decode."""
+    args = [
+        "--data-parallel-size",
+        "2",
+        "--max-model-len",
+        "128",
+        "--max-num-batched-tokens",
+        "128",
+        "--max-num-seqs",
+        "4",
+    ]
+    if enforce_eager:
+        args.append("--enforce-eager")
+
+    def generate(extra_args):
+        with (
+            RemoteOpenAIServer(MODEL_NAME, args + extra_args) as server,
+            server.get_client() as client,
+        ):
+            return client.completions.create(
+                model=MODEL_NAME,
+                prompt="The capital of France is",
+                max_tokens=8,
+                temperature=0,
+                logprobs=1,
+                extra_body={"return_token_ids": True},
+            ).choices[0]
+
+    baseline = generate([])
+    sharded = generate(
+        [
+            "--embedding-tensor-parallel-size",
+            "2",
+            "--lmhead-tensor-parallel-size",
+            "2",
+        ]
+    )
+    assert sharded.model_extra is not None and baseline.model_extra is not None
+    assert sharded.model_extra["token_ids"] == baseline.model_extra["token_ids"]
+    assert sharded.model_extra["token_ids"]
+    assert sharded.logprobs is not None and baseline.logprobs is not None
+    assert sharded.logprobs.token_logprobs == pytest.approx(
+        baseline.logprobs.token_logprobs, abs=0.02
+    )
+
+
 # Number of data parallel ranks for multi-node internal LB testing
 DP_SIZE = int(os.getenv("DP_SIZE", "2"))
 # Default tensor parallel size to use

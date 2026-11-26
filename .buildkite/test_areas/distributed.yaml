@@ -337,7 +337,10 @@ steps:
   - tests/v1/engine/test_engine_core_client.py
   - tests/distributed/test_utils
   - tests/distributed/test_engram_dp_shard.py
+  - tests/distributed/test_fine_grained_vocab_tp.py
   - vllm/config/engram.py
+  - vllm/model_executor/layers/vocab_parallel_embedding.py
+  - vllm/model_executor/layers/logits_processor.py
   - vllm/models/deepseek_v41/
   commands:
   # https://github.com/NVIDIA/nccl/issues/1838
@@ -350,7 +353,10 @@ steps:
   - TP_SIZE=1 DP_SIZE=4 pytest -v -s v1/distributed/test_hybrid_lb_dp.py
   - pytest -v -s v1/engine/test_engine_core_client.py::test_kv_cache_events_dp
   - pytest -v -s distributed/test_utils.py
-  - pytest -v -s distributed/test_engram_dp_shard.py
+  - >-
+    pytest -v -s
+    distributed/test_engram_dp_shard.py
+    distributed/test_fine_grained_vocab_tp.py
   mirror:
     amd:
       # Run on PRs even when the L4 step is optional (nightly only).
@@ -369,7 +375,10 @@ steps:
       - tests/v1/engine/test_engine_core_client.py
       - tests/distributed/test_utils
       - tests/distributed/test_engram_dp_shard.py
+      - tests/distributed/test_fine_grained_vocab_tp.py
       - vllm/config/engram.py
+      - vllm/model_executor/layers/vocab_parallel_embedding.py
+      - vllm/model_executor/layers/logits_processor.py
       - vllm/models/deepseek_v41/
       - vllm/platforms/rocm.py
       commands:
@@ -382,7 +391,10 @@ steps:
       - TP_SIZE=1 DP_SIZE=4 pytest -v -s v1/distributed/test_hybrid_lb_dp.py
       - pytest -v -s v1/engine/test_engine_core_client.py::test_kv_cache_events_dp
       - pytest -v -s distributed/test_utils.py
-      - pytest -v -s distributed/test_engram_dp_shard.py
+      - >-
+        pytest -v -s
+        distributed/test_engram_dp_shard.py
+        distributed/test_fine_grained_vocab_tp.py
 
 - label: ":nvidia: (L4) [Nightly] Distributed Compile + Comm"
   key: distributed-compile-comm-4-gpus

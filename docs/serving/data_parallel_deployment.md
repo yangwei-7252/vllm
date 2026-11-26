@@ -4,6 +4,29 @@ vLLM supports Data Parallel deployment, where model weights are replicated acros
 
 This will work with both dense and MoE models.
 
+### Sharding token embeddings and the LM head across DP replicas
+
+For MoE generation, `--embedding-tensor-parallel-size` and
+`--lmhead-tensor-parallel-size` independently shard vocabulary weights along
+the DP axis. Both default to 1 and must divide the DP size. For example,
+`--data-parallel-size 4 --tensor-parallel-size 2 --embedding-tensor-parallel-size 2 --lmhead-tensor-parallel-size 4`
+places one quarter of the padded embedding table and one eighth of the padded
+LM head on each device. Tied weights require equal factors.
+
+Embedding gathers token IDs, looks up the local vocabulary shard and
+reduce-scatters the vectors to their request owners. The LM head gathers
+sampled hidden states and exchanges projected vocabulary columns by all-to-all.
+Standard TP then completes the embedding sum or logits gather. Idle DP ranks
+participate. Each exchange pads to a common capacity, so the additional
+communication and temporary storage depend on the configured batch limits.
+
+Use a static DP group and a single pipeline stage. Cross-DP vocabulary sharding
+currently excludes LoRA. LM head sharding also excludes prompt logprobs,
+batch-sharded sampling and LiLiCorr. Custom model
+implementations must route input lookup and output projection through the
+vocabulary-parallel layers. A token embedding constructed without a standard
+token-embedding prefix can identify itself with `is_token_embedding=True`.
+
 For MoE models, particularly those like DeepSeek that employ MLA (Multi-head Latent Attention), it can be advantageous to use data parallel for the attention layers and expert or tensor parallel (EP or TP) for the expert layers.
 
 In these cases, the data parallel ranks are not completely independent. Forward passes must be aligned, and expert layers across all ranks are required to synchronize during every forward pass, even when there are fewer requests to be processed than DP ranks.
